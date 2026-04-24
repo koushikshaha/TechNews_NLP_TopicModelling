@@ -1,0 +1,427 @@
+---
+title: "The Verge Tech News — Text Mining & Topic Modelling"
+author: "Group 01"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+---
+
+# Introduction
+
+This project performs **text mining and topic modelling** on technology news articles scraped from [The Verge](https://www.theverge.com). We collect article titles, authors, dates, and full body text from the archive, then apply natural language processing (NLP) techniques including tokenization, lemmatization, TF-IDF, and Latent Dirichlet Allocation (LDA) to discover key themes and trends in tech journalism.
+
+---
+
+# Setup & Libraries
+
+```{r install, eval=FALSE}
+packages <- c(
+  "textstem", "rvest", "purrr", "dplyr", "stringr", "stringi", "topicmodels",
+  "tm", "SnowballC", "tidytext", "ggplot2", "wordcloud", "RColorBrewer"
+)
+install.packages(packages)
+```
+
+```{r libraries}
+library(textstem)
+library(rvest)
+library(purrr)
+library(dplyr)
+library(stringr)
+library(stringi)
+library(topicmodels)
+library(tm)
+library(SnowballC)
+library(tidytext)
+library(ggplot2)
+library(wordcloud)
+library(RColorBrewer)
+```
+
+---
+
+# Data Collection (Web Scraping)
+
+## Text Cleaning Function
+
+Before scraping, we define a cleaning function that standardises text encoding, removes URLs, punctuation, and extra whitespace.
+
+```{r clean-function}
+clean_text <- function(x) {
+  x %>%
+    iconv(from = "latin1", to = "UTF-8", sub = "") %>%
+    stri_trans_general("latin-ascii") %>%
+    str_to_lower() %>%
+    str_replace_all("https?://\\S+", "") %>%
+    str_replace_all("[[:punct:]]", " ") %>%
+    str_replace_all("[\r\n]", " ") %>%
+    str_replace_all("[^[:print:]]", " ") %>%
+    str_squish()
+}
+```
+
+## Scrape Archive Pages
+
+We scrape The Verge tech archive pages (pages 1–30), extracting article **titles**, **links**, **dates**, and **authors**.
+
+```{r scrape-archive}
+get_verge_page <- function(page_num) {
+  base_url <- "https://www.theverge.com"
+  url  <- paste0(base_url, "/tech/archives/", page_num)
+  page <- tryCatch(read_html(url, encoding = "UTF-8"), error = function(e) NULL)
+  if (is.null(page)) return(NULL)
+
+  titles  <- page %>% html_elements("div.hp1qhq3 :not(span) > a") %>% html_text2()
+  links   <- page %>% html_elements("div.hp1qhq3 :not(span) > a") %>% html_attr("href")
+  dates   <- page %>% html_elements("div.hp1qhq3 time")            %>% html_attr("datetime")
+  authors <- page %>% html_elements("div.hp1qhq3 span span span span") %>% html_text2()
+
+  n <- min(length(titles), length(links), length(dates), length(authors))
+  if (n == 0) return(NULL)
+
+  tibble(
+    Title  = titles[1:n],
+    Link   = links[1:n],
+    Date   = dates[1:n],
+    Author = authors[1:n]
+  )
+}
+
+page_range   <- 1:30
+results_list <- list()
+
+for (i in page_range) {
+  cat("Scraping page", i, "\n")
+  tmp <- get_verge_page(i)
+  if (!is.null(tmp)) results_list[[length(results_list) + 1]] <- tmp
+}
+
+result <- bind_rows(results_list)
+cat("Total raw rows scraped:", nrow(result), "\n")
+```
+
+## Scrape Article Body Text
+
+For each article link we scrape the full body text and apply the cleaning function.
+
+```{r scrape-articles}
+get_article_text <- function(url) {
+  tryCatch({
+    page       <- read_html(url, encoding = "UTF-8")
+    paragraphs <- page %>%
+      html_elements("div.duet--article--article-body-component p") %>%
+      html_text2()
+    clean_text(paste(paragraphs, collapse = " "))
+  }, error = function(e) NA)
+}
+```
+
+---
+
+# Data Cleaning
+
+## Filter & Standardise Links
+
+We remove rows with missing fields, fix relative URLs, and keep only links pointing to The Verge domain.
+
+```{r clean-results}
+base_url <- "https://www.theverge.com"
+
+results <- result %>%
+  filter(
+    !is.na(Title),  Title  != "",
+    !is.na(Link),   Link   != "",
+    !is.na(Date),   Date   != "",
+    !is.na(Author), Author != "",
+    !str_detect(Link, "^#")
+  ) %>%
+  mutate(Link = if_else(str_detect(Link, "^https?://"), Link, str_c(base_url, Link))) %>%
+  distinct(Link, .keep_all = TRUE) %>%
+  filter(str_detect(Link, "^https?://([a-zA-Z0-9-]+\\.)?theverge\\.com"))
+
+# Remove placeholder author "and"
+results1 <- results %>% filter(Author != "and")
+```
+
+## Fetch Article Text & Clean Fields
+
+```{r fetch-text}
+results1$ArticleText <- map_chr(results1$Link, possibly(get_article_text, NA_character_))
+
+results1 <- results1 %>%
+  mutate(
+    Title       = clean_text(Title),
+    Author      = clean_text(Author),
+    ArticleText = clean_text(ArticleText)
+  ) %>%
+  filter(!is.na(ArticleText), ArticleText != "")
+
+cat("Articles with text:", nrow(results1), "\n")
+```
+
+## Clean Dates
+
+```{r clean-dates}
+results1 <- results1 %>%
+  mutate(Date_clean = suppressWarnings(as.Date(Date))) %>%
+  filter(!is.na(Date_clean)) %>%
+  mutate(Date = Date_clean) %>%
+  select(-Date_clean)
+
+cat("Date range:", as.character(min(results1$Date)),
+    "to", as.character(max(results1$Date)), "\n")
+```
+
+## Preview Cleaned Dataset
+
+```{r preview}
+head(results1 %>% select(Title, Author, Date))
+```
+
+---
+
+# Tokenization & Lemmatization
+
+We tokenize the article text into individual words, remove standard and custom stop words, keep only alphabetic tokens, and then lemmatize each word (reduce to its base form).
+
+```{r tokenize}
+custom_stopwords <- c("ita", "verge", "tech", "said", "will", "youa", "ia", "thata", "wea")
+
+tokens <- results1 %>%
+  select(Link, ArticleText) %>%
+  unnest_tokens(word, ArticleText) %>%
+  filter(!word %in% stop_words$word) %>%
+  filter(!word %in% custom_stopwords) %>%
+  filter(str_detect(word, "^[a-z]+$")) %>%
+  mutate(word = lemmatize_words(word))
+
+cat("Total tokens after cleaning:", nrow(tokens), "\n")
+```
+
+---
+
+# Word Frequency Analysis
+
+## Top 20 Most Frequent Words
+
+```{r word-freq}
+word_freq <- tokens %>%
+  count(word, sort = TRUE) %>%
+  top_n(20, n)
+
+ggplot(word_freq, aes(x = reorder(word, n), y = n)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 20 Words in The Verge Articles",
+       x = "Word", y = "Frequency") +
+  theme_minimal()
+```
+
+## Word Cloud (Top 80 Words)
+
+```{r wordcloud, fig.height=7}
+custom_word_freq <- tokens %>%
+  count(word, sort = TRUE) %>%
+  top_n(80, n)
+
+wordcloud(
+  words        = custom_word_freq$word,
+  freq         = custom_word_freq$n,
+  min.freq     = 2,
+  max.words    = 500,
+  random.order = FALSE,
+  colors       = brewer.pal(8, "Dark2")
+)
+```
+
+---
+
+# TF-IDF Analysis
+
+**TF-IDF** (Term Frequency–Inverse Document Frequency) measures how important a word is to a specific article relative to all articles. High TF-IDF words are distinctive to that article.
+
+```{r tfidf}
+tfidf <- tokens %>%
+  count(Link, word) %>%
+  bind_tf_idf(word, Link, n)
+
+# Top 5 TF-IDF words per article, joined with titles
+top_tfidf <- tfidf %>%
+  group_by(Link) %>%
+  slice_max(tf_idf, n = 5) %>%
+  ungroup() %>%
+  left_join(results1 %>% select(Link, Title), by = "Link") %>%
+  mutate(Title_short = str_trunc(Title, 40))
+
+# Sample: top ~12 articles
+tfidf_sample <- top_tfidf %>%
+  group_by(Title_short) %>%
+  slice_max(tf_idf, n = 5) %>%
+  ungroup() %>%
+  slice_max(tf_idf, n = 60)
+
+ggplot(tfidf_sample, aes(x = reorder_within(word, tf_idf, Title_short),
+                          y = tf_idf, fill = Title_short)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ Title_short, scales = "free") +
+  scale_x_reordered() +
+  coord_flip() +
+  labs(title = "Top TF-IDF Words per Article",
+       x = "Word", y = "TF-IDF Score") +
+  theme_minimal(base_size = 8)
+```
+
+---
+
+# Document-Term Matrix
+
+We build a **Document-Term Matrix (DTM)** where each row is an article and each column is a word. This is required for LDA topic modelling.
+
+```{r dtm}
+dtm <- tokens %>%
+  count(Link, word) %>%
+  cast_dtm(document = Link, term = word, value = n)
+
+cat("DTM dimensions:", dim(dtm)[1], "documents x", dim(dtm)[2], "terms\n")
+```
+
+---
+
+# Topic Modelling (LDA)
+
+**Latent Dirichlet Allocation (LDA)** is an unsupervised machine learning technique that discovers hidden topics in a collection of documents. Each topic is a probability distribution over words.
+
+We set **k = 6 topics**.
+
+```{r lda-model}
+set.seed(123)
+k         <- 6
+lda_model <- LDA(dtm, k = k, control = list(seed = 123))
+
+lda_terms <- tidy(lda_model, matrix = "beta")   # word-topic probabilities
+lda_docs  <- tidy(lda_model, matrix = "gamma")  # doc-topic probabilities
+```
+
+## Top Terms per Topic
+
+Each bar shows the top 10 words most associated with each topic (by beta probability).
+
+```{r lda-top-terms, fig.height=8}
+top_terms <- lda_terms %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+ggplot(top_terms, aes(x = reorder_within(term, beta, topic),
+                       y = beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_x_reordered() +
+  coord_flip() +
+  labs(title = "Top Terms per LDA Topic",
+       x = "Term", y = "Beta (Probability)") +
+  theme_minimal()
+```
+
+## Most Common Topics Across Articles
+
+This chart shows how many articles are primarily associated with each topic.
+
+```{r lda-doc-topics}
+doc_topics <- lda_docs %>%
+  group_by(document) %>%
+  slice_max(gamma, n = 1) %>%
+  ungroup()
+
+ggplot(doc_topics, aes(x = factor(topic))) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Most Common Topics Across Articles",
+       x = "Topic", y = "Count of Articles") +
+  theme_minimal()
+```
+
+## Word Clouds per Topic
+
+A word cloud for each of the 6 LDA topics, where word size reflects the beta probability.
+
+```{r lda-wordclouds, fig.height=5}
+for (i in 1:k) {
+  terms_topic <- lda_terms %>%
+    filter(topic == i) %>%
+    arrange(desc(beta))
+
+  wordcloud(
+    words        = terms_topic$term,
+    freq         = terms_topic$beta,
+    max.words    = 100,
+    colors       = brewer.pal(8, "Dark2"),
+    random.order = FALSE,
+    main         = paste("Topic", i)
+  )
+  title(paste("Topic", i))
+}
+```
+
+---
+
+# Trend Analysis
+
+## Number of Articles Published Over Time
+
+```{r trend}
+trend_data <- results1 %>% count(Date)
+
+ggplot(trend_data, aes(x = Date, y = n)) +
+  geom_line(color = "blue") +
+  geom_point() +
+  labs(title = "Trend of Articles Published Over Time",
+       x = "Date", y = "Number of Articles") +
+  theme_minimal()
+```
+
+---
+
+# Save Outputs
+
+The cleaned dataset, TF-IDF scores, and DTM are saved as CSV files. **Update the paths below to match your local machine.**
+
+```{r save, eval=FALSE}
+write.csv(results1,          "clean_news2.csv",   row.names = FALSE)
+write.csv(tfidf,             "tfidf_verge.csv",   row.names = FALSE)
+write.csv(as.matrix(dtm),    "dtm_verge.csv")
+
+cat("Saved", nrow(results1), "records to clean_news2.csv\n")
+cat("Saved TF-IDF data to tfidf_verge.csv\n")
+cat("Saved DTM to dtm_verge.csv\n")
+```
+
+---
+
+# Conclusion
+
+This project scraped and analysed technology news articles from The Verge using text mining and NLP techniques. Key findings include:
+
+- The most frequent terms across all articles reflect dominant tech topics such as AI, software, devices, and companies.
+- **TF-IDF** analysis revealed that each article has a distinctive vocabulary that differentiates it from others.
+- **LDA topic modelling** successfully identified 6 latent topics, capturing themes such as consumer electronics, AI/software, policy, and media.
+- **Publication trends** show variation in article volume over the scraped time period.
+
+This type of analysis is valuable for understanding media focus, tracking emerging tech trends, and building recommendation or classification systems.
