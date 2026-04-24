@@ -73,7 +73,7 @@ TechNews_NLP_TopicModelling/
 
 ### Step 1 — Clone the Repository
 ```bash
-git clone https://github.com/yourusername/TechNews_NLP_TopicModelling_G01.git
+git clone https://github.com/koushikshsaha/TechNews_NLP_TopicModelling_G01.git
 cd TechNews_NLP_TopicModelling_G01
 ```
 
